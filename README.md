@@ -27,10 +27,11 @@ Ziyuan Cai - Create Markdown
 
 - DV – Fire Risk
 - Spatial and temporal Lag
+- Logistic Regression
 
 5. **How will you validate this model (cross-validation & goodness of fit metrics that relate to the business process)?**  
 
-Spatial cross-validation
+- Spatial cross-validation
  
 6. **How do you think that stakeholders would want to consume this data?**  
 
