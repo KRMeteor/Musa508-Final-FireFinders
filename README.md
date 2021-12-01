@@ -37,7 +37,7 @@ Ziyuan Cai - Create Markdown
 
 - Phone app/website where you put your address
 
-6. **What are the use cases for your app and what should the app do?**  
+7. **What are the use cases for your app and what should the app do?**  
 
 - The app would give each address a fire risk score and a brief description about that score.
 - Citizens could use the app to determine their risk at home or anywhere else in the state.
