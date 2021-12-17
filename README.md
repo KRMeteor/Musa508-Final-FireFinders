@@ -1,9 +1,9 @@
-# Musa508-Final-Firefighters
+# Musa508-Final-FireFinders
 
 ## Authors
 
-Ben Aiken - Record Video
-Ziyuan Cai - Create Markdown
+- Ben Aiken - Record Video
+- Ziyuan Cai - Create Markdown
 
 ## Use Case Questions
 

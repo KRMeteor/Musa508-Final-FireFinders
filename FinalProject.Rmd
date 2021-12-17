@@ -1,0 +1,1298 @@
+---
+title: "Forecasting wildfire risk for a region in California"
+author: "Ben Aiken and Ziyuan Cai"
+date: "12/16/2021"
+output: 
+  rmdformats::readthedown:
+    self_contained: true
+    thumbnails: true
+    lightbox: true
+    gallery: false
+    highlight: tango
+    code_folding: hide
+---
+# Introduction
+
+In 2020, four million acres of California burned in wildfires. Over 600,000 California residents were displaced$^{1}$ and 31 lost their lives$^{2}$. 2021 was no different, recording the largest single source fire ever, the Dixie fire, which blazed from July 13th until October 25th when it was eventually controlled by firefighters. These historically rare disasters are becoming far more frequent due to climate change. Extreme drought and higher wind speeds provide wildfires the fuel and oxygen to spread quickly$^{3}$.
+
+```{r setup, message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(error = FALSE)
+
+# LIBRARIES
+library(rjson)
+library(tidycensus)
+library(tidyverse)
+library(sf)
+library(spdep)
+library(caret)
+library(ckanr)
+library(FNN)
+library(grid)
+library(gridExtra)
+library(ggcorrplot)
+library(jtools)  
+library(viridis)
+library(kableExtra)
+library(rlist)
+library(dplyr)
+library(osmdata)
+library(geosphere)
+library(fastDummies)
+library(FNN)
+library(viridis)
+library(stargazer)
+library(pscl)
+library(pROC)
+library(plotROC)
+library(RANN)
+library(riem)
+options(scipen=999)
+options(tigris_class = "sf")
+
+# THEMES AND FUNCTIONS
+mapTheme <- function(base_size = 12) {
+  theme(
+    text = element_text( color = "black"),
+    plot.title = element_text(size = 14,colour = "black"),
+    plot.subtitle=element_text(face="italic"),
+    plot.caption=element_text(hjust=0),
+    axis.ticks = element_blank(),
+    panel.background = element_blank(),axis.title = element_blank(),
+    axis.text = element_blank(),
+    axis.title.x = element_blank(),
+    axis.title.y = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.border = element_rect(colour = "black", fill=NA, size=2)
+  )
+}
+
+plotTheme <- function(base_size = 12) {
+  theme(
+    text = element_text( color = "black"),
+    plot.title = element_text(size = 14,colour = "black"),
+    plot.subtitle = element_text(face="italic"),
+    plot.caption = element_text(hjust=0),
+    axis.ticks = element_blank(),
+    panel.background = element_blank(),
+    panel.grid.major = element_line("grey80", size = 0.1),
+    panel.grid.minor = element_blank(),
+    panel.border = element_rect(colour = "black", fill=NA, size=2),
+    strip.background = element_rect(fill = "grey80", color = "white"),
+    strip.text = element_text(size=12),
+    axis.title = element_text(size=12),
+    axis.text = element_text(size=10),
+    plot.background = element_blank(),
+    legend.background = element_blank(),
+    legend.title = element_text(colour = "black", face = "italic"),
+    legend.text = element_text(colour = "black", face = "italic"),
+    strip.text.x = element_text(size = 14)
+  )
+}
+
+# PALETTE
+palette2 <- c("#F96167","#FCE77D")
+
+qBr <- function(df, variable, rnd) {
+  if (missing(rnd)) {
+    as.character(quantile(round(df[[variable]],0),
+                          c(.01,.2,.4,.6,.8), na.rm=T))
+  } else if (rnd == FALSE | rnd == F) {
+    as.character(formatC(quantile(df[[variable]]), digits = 3),
+                 c(.01,.2,.4,.6,.8), na.rm=T)
+  }
+}
+
+q5 <- function(variable) {as.factor(ntile(variable, 5))}
+
+# FUNCTIONS
+nn_function <- function(measureFrom,measureTo,k) {
+  measureFrom_Matrix <- as.matrix(measureFrom)
+  measureTo_Matrix <- as.matrix(measureTo)
+  nn <-   
+    get.knnx(measureTo, measureFrom, k)$nn.dist
+  output <-
+    as.data.frame(nn) %>%
+    rownames_to_column(var = "thisPoint") %>%
+    gather(points, point_distance, V1:ncol(.)) %>%
+    arrange(as.numeric(thisPoint)) %>%
+    group_by(thisPoint) %>%
+    summarize(pointDistance = mean(point_distance)) %>%
+    arrange(as.numeric(thisPoint)) %>% 
+    dplyr::select(-thisPoint) %>%
+    pull()
+  
+  return(output)  
+}
+
+get_weather <- function(stations, year){
+  
+  i <- 1
+  weather_data_list <- list()
+  for(station_id in stations){
+    print(paste("Processing", station_id))
+    for(year in year){
+      start_date = paste0(year, "05-01")
+      end_date = paste0(year, "11-30")
+      weather_data <- riem_measures(station = station_id, date_start = start_date, 
+                                    date_end = end_date) %>% 
+        dplyr::summarise(id = station_id,
+                         year = year,
+                         Mean_Temp = mean(tmpf, na.rm = TRUE),
+                         Max_Temp = max(tmpf, na.rm = TRUE),
+                         Mean_Precipitation = mean(p01i, na.rm = TRUE),
+                         Mean_Humidity = mean(relh, na.rm = TRUE),
+                         Min_Humidity = min(relh, na.rm = TRUE),
+                         Max_Humidity = max(relh, na.rm = TRUE),
+                         Mean_Wind_Speed = mean(sknt, na.rm = TRUE),
+                         Max_Wind_Speed = max(sknt, na.rm = TRUE),
+        ) 
+      weather_data_list[[i]] <- weather_data
+      i <- i + 1
+    }
+  }
+  do.call("rbind", weather_data_list) 
+}
+```
+
+```{r show fire, message=FALSE, warning=FALSE}
+# READ IN DATA
+# EPSG3310 is a meter crs
+fire_pt <- st_read("https://services1.arcgis.com/jUJYIo9tSA7EHvfZ/arcgis/rest/services/California_Fire_Perimeters/FeatureServer/0/query?outFields=*&where=1%3D1&f=geojson")%>%
+  st_transform('EPSG:3310')
+
+fire_perimeter1220 <- fire_pt %>% 
+  filter(YEAR_=="2012"|YEAR_=="2013"|YEAR_=="2014"|YEAR_=="2015"|
+         YEAR_=="2016"|YEAR_=="2017"|YEAR_=="2018"|YEAR_=="2019"|YEAR_=="2020")
+
+all_counties<- st_read("https://data-cdtfa.opendata.arcgis.com/datasets/9633b3eecf634690ba8cf3a622eacd98_1.geojson?outSR=%7B%22latestWkid%22%3A3857%2C%22wkid%22%3A102100%7D") %>%
+  st_transform('EPSG:3310') %>%
+  dplyr::select(strCounty_1, geometry) %>%
+  unique()
+
+ggplot() +
+  geom_sf(data = fire_perimeter1220, fill="orange", color="transparent")+
+  geom_sf(data=all_counties, fill="transparent")+ 
+  labs(title="Figure 1 - California Wildfires",
+       subtitle="Years 2012-2020")+
+  mapTheme()
+```
+
+The situation is worsened by the fact that, due to the mixed land ownership throughout the state, the agencies responsible for fire mitigation are not necessarily consistent in their efforts. 48% of California land is federally owned$^{4}$ and there are over 100 Native American Reservations in the state, often in mountainous regions that are more fire prone.  Unfortunately, some studies have found that wealthier, whiter, and more educated communities are provided with superior support for fire management by local and state agencies$^{5}$. Furthermore, some preventative measures including fuel reduction (the removal of flammable materials such as dead trees and leaves) are often allocated inequitably by the state. These complications, in addition to the changing climate, are driving fire insurance rates up beyond the budget of many homeowners. In fact, insurance companies have decided homes in some parts of the state are too risky to insure at all, leaving residents vulnerable.
+
+In response to this growing crisis, Fire Finders was formed to provide California residents with real-time fire risk. Homeowners and potential homebuyers deserve transparency when it comes to the fire risk of their property. Additionally, this tool will educate California residents about the main contributing factors of their area’s risk, along with several resources to protect their property.
+
+# User Interface
+
+To keep the Fire Finder resource as accessible as possible, the website is limited to just three main components displayed in Figures 2 through 4.
+
+![Figure 2 - Home Page](/Users/baiken/Desktop/508 Final Project/Home Page.png)
+
+Figure 2 shows the home page where visitors will see current fires plotted on a heat map of fire risk throughout the state.
+
+![Figure 3 - Search Results](/Users/baiken/Desktop/508 Final Project/Search Results.png)
+
+By entering an address into the search bar, visitors are directed to the Search Results page displayed in Figure 3. The map zooms to the area and the sidebar shows the risk grade along with the top four factors that contributed to this grade.
+
+Clicking the “How can I reduce my risk?” button in the lower left corner leads visitors to the Resource page shown in Figure 4.
+
+![Figure 4 - Resource Component](/Users/baiken/Desktop/508 Final Project/Resources.png)
+
+The resources listed are recommended by a California Firefighter and, while they will not change the risk score, they suggest several methods to protect residents and their property in spite of the risk. Follow the video link for details: https://youtu.be/J849OY7F_Bw.
+
+# Method
+
+Fire Finders started model development by consulting a member of the Modesto Fire Department.  Shane Feuerbach has served on the fire department for the last four years and provided key insight into the dangerous conditions that lead wildfires to spread so quickly.  His domain knowledge informed the data collection and the design of the webpage, specifically the resource page.
+
+The arid climate makes for the perfect wildfire conditions, but 88% of wildfires are sparked by humans.  Some fires ignite from lightning strikes, but the vast majority are started due to improper campfire management, electrical fires, and other negligence.  This makes predicting a fire event, which is already relatively rare, even more challenging.  With that in mind, Fire Finders is not focused on predicting the source of wildfires - this is not a map of human carelessness.  Instead, Fire Finders is designed to predict the areas that have the conditions most conducive for wildfires, and are therefore most likely to be where wildfires spread.
+
+Given the size of California, only eleven counties were included in this model.  They include:
+Fresno
+Kern
+Kings
+Los Angeles
+Madera
+Monterey
+San Benito
+San Luis Obispo
+Santa Barbara
+Tulare
+Ventura
+These Southern California counties were selected because of the mixed land use and land cover of the region.  Focusing on a diverse area can create the most generalizable model for the entire state.  Additionally, these counties are home to over 40% of Californians, which, given the resident use case, is a major priority of the app.  This is displayed in Figure 5.
+
+![Figure 5 - Vegetation Land Cover](/Users/baiken/Desktop/508 Final Project/California Vegetation.png)
+
+```{r county_selected_map, message=FALSE, warning=FALSE}
+county <- st_read("https://data-cdtfa.opendata.arcgis.com/datasets/9633b3eecf634690ba8cf3a622eacd98_1.geojson?outSR=%7B%22latestWkid%22%3A3857%2C%22wkid%22%3A102100%7D") %>%
+  st_transform('EPSG:3310') %>%
+  dplyr::select(strCounty_1, geometry) %>%
+  unique() %>%
+  filter(strCounty_1 == 'Los Angeles' | strCounty_1 == 'Ventura' | 
+           strCounty_1 == 'Santa Barbara' | strCounty_1 == 'San Luis Obispo' |
+           strCounty_1 == 'Kern' | strCounty_1 == 'Tulare' | 
+           strCounty_1 == 'Kings' | strCounty_1 == 'Fresno' |
+           strCounty_1 == 'Madera' | strCounty_1 == 'San Benito' | 
+           strCounty_1 == 'Monterey')
+
+ggplot() +
+  geom_sf(data = fire_perimeter1220, fill="orange", color="transparent")+
+  geom_sf(data=all_counties, fill="transparent")+ 
+  geom_sf(data=county, fill="transparent", color="#F96167", size=1)+ 
+  labs(title="Figure 6 - California Wildfires",
+       subtitle="Years 2012-2020 Counties selected")+
+  mapTheme()
+```
+
+# Data
+
+Based on the conversation with Shane Feuerbach, several climate variables and other predictors were selected.  Climate data was gathered from the Automated Surface Observation System for weather, USDA Forest Service for Ecoregions and Vegetation, Cal Fire for seed zones, and USGS for land cover.  Additionally, fire perimeters and precautionary measures including control burns and fuel reduction efforts were supplied by Cal Fire along with the locations of all firehouses and related facilities.  
+
+The Wildland Urban Interface, which describes the relationship between a built community and the surrounding environment is used by Fire Departments to classify towns given their level of natural defense against fires.  A community with forest intermixed with buildings is far more dangerous that a cluster of buildings separated completely from the forest.  This data was also included via Cal Fire.
+
+Finally, the Digital Elevation Model from NASA and the NGA provided elevation data, which was also used to calculate the ground slope.
+
+```{r load_data, message=FALSE, warning=FALSE, cache=TRUE, results=FALSE}
+# READ IN DATA
+seed_zones <- st_read("/Users/baiken/Desktop/508 Final Project/seed zones") %>%
+  st_transform('EPSG:3310')
+
+control_burns <- st_read("/Users/baiken/Desktop/508 Final Project/control burns") %>%
+  st_transform('EPSG:3310')
+
+fuel_reduction <- st_read("/Users/baiken/Desktop/508 Final Project/fuel reduction") %>%
+  st_transform('EPSG:3310')
+
+ecoregions <- st_read("/Users/baiken/Desktop/508 Final Project/Ecoregions") %>%
+  st_transform('EPSG:3310')
+
+facilities <- st_read("/Users/baiken/Desktop/508 Final Project/facilities") %>%
+  st_transform('EPSG:3310')
+
+# Vegetation
+centralcoast <- st_read("/Users/baiken/Desktop/508 Final Project/Vegetation/CentralCoast")%>%
+  st_transform('EPSG:3310')
+
+centralvalley <- st_read("/Users/baiken/Desktop/508 Final Project/Vegetation/CentralValley")%>%
+  st_transform('EPSG:3310')
+
+greatbasin <- st_read("/Users/baiken/Desktop/508 Final Project/Vegetation/GreatBasin")%>%
+  st_transform('EPSG:3310')
+
+SouCoast <- st_read("/Users/baiken/Desktop/508 Final Project/Vegetation/SouthCoast")%>%
+  st_transform('EPSG:3310')
+
+SouInterior <- st_read("/Users/baiken/Desktop/508 Final Project/Vegetation/SouthInterior")%>%
+  st_transform('EPSG:3310')
+
+SouSierra <- st_read("/Users/baiken/Desktop/508 Final Project/Vegetation/SouthSierra")%>%
+  st_transform('EPSG:3310')
+
+Veg <- rbind(centralcoast, centralvalley, greatbasin, SouCoast, SouInterior, SouSierra)
+Veg <- Veg%>%
+  mutate(land_cover = case_when(USGS_ANDER == 1 ~ "Urban or build-up land",
+                                USGS_ANDER == 2 ~ "Agriculture land",
+                                USGS_ANDER == 3 ~ "Rangeland",
+                                USGS_ANDER == 4 ~ "Forest Land",
+                                USGS_ANDER == 5 ~ "Water",
+                                USGS_ANDER == 6 ~ "Wetland",
+                                USGS_ANDER == 7 ~ "Barren land",
+                                USGS_ANDER == 9 ~ "Perennial Snow or Ice"
+  ))
+
+WUI <- st_read("/Users/baiken/Desktop/508 Final Project/WUI")%>%
+  st_transform('EPSG:3310')
+
+elevation <- st_read("/Users/baiken/Desktop/508 Final Project/selected elevation")%>%
+  st_transform('EPSG:3310')
+
+slope <- st_read("/Users/baiken/Desktop/508 Final Project/Edited Slope")%>%
+  st_transform('EPSG:3310')
+```
+
+## Feature Creating
+
+The selected counties were divided into a 5,000 meter fishnet grid and each cell was assigned its mean value for continuous predictors.  Categorical predictors were assigned similarly. Additionally, several features were engineer including the cell's history of fire (particularly the prior year) and distance to nearest fire facility among others.
+
+```{r data_process, message=FALSE, warning=FALSE, cache=TRUE, results=FALSE}
+## Creating fishnet and aggregate variables
+study_area <- 
+  st_union(county) %>%
+  st_sf()
+
+fishnet <- 
+  st_make_grid(study_area,
+               cellsize = 5000, 
+               square = TRUE) %>%
+  .[study_area] %>%
+  st_sf() %>%
+  mutate(uniqueID = rownames(.))
+
+# Aggregate fire
+fire_perimeter11 <- fire_pt %>% 
+  filter(YEAR_=="2011")
+
+fire_perimeter12 <- fire_pt %>% 
+  filter(YEAR_=="2012")
+
+fire_perimeter13 <- fire_pt %>% 
+  filter(YEAR_=="2013")
+
+fire_perimeter14 <- fire_pt %>% 
+  filter(YEAR_=="2014")
+
+fire_perimeter15 <- fire_pt %>% 
+  filter(YEAR_=="2015")
+
+fire_perimeter16 <- fire_pt %>% 
+  filter(YEAR_=="2016")
+
+fire_perimeter17 <- fire_pt %>% 
+  filter(YEAR_=="2017")
+
+fire_perimeter18 <- fire_pt %>% 
+  filter(YEAR_=="2018")
+
+fire_perimeter19 <- fire_pt %>% 
+  filter(YEAR_=="2019")
+
+fire_perimeter20 <- fire_pt %>% 
+  filter(YEAR_=="2020")
+
+fire_net11 <- fire_perimeter11 %>% 
+  dplyr::select(OBJECTIVE) %>% 
+  mutate(fire = 0) %>% 
+  aggregate(., fishnet, sum) %>%
+  mutate(uniqueID = rownames(.),
+         fire = replace_na(fire, 0),
+         OBJECTIVE = replace_na(OBJECTIVE, 0)) %>%
+  mutate(fire = ifelse(OBJECTIVE == 0, 0, 1),
+         year = 2011) %>%
+  dplyr::select(-OBJECTIVE)
+
+fire_net12 <- fire_perimeter12 %>% 
+  dplyr::select(OBJECTIVE) %>% 
+  mutate(fire = 0) %>% 
+  aggregate(., fishnet, sum) %>%
+  mutate(uniqueID = rownames(.),
+         fire = replace_na(fire, 0),
+         OBJECTIVE = replace_na(OBJECTIVE, 0)) %>%
+  mutate(fire = ifelse(OBJECTIVE == 0, 0, 1),
+         year = 2012) %>%
+  dplyr::select(-OBJECTIVE)
+fire_net12 <- fire_net12 %>%
+  left_join(., 
+            fire_net11%>%
+              mutate(fire=ifelse(fire==1,"Yes","No"))%>%
+              rename(fire_lastyear=fire)%>%
+              dplyr::select(fire_lastyear,uniqueID)%>%
+              st_drop_geometry(), 
+            by=c("uniqueID"))
+
+fire_net13 <- fire_perimeter13 %>% 
+  dplyr::select(OBJECTIVE) %>% 
+  mutate(fire = 0) %>% 
+  aggregate(., fishnet, sum) %>%
+  mutate(uniqueID = rownames(.),
+         fire = replace_na(fire, 0),
+         OBJECTIVE = replace_na(OBJECTIVE, 0)) %>%
+  mutate(fire = ifelse(OBJECTIVE == 0, 0, 1),
+         year = 2013) %>%
+  dplyr::select(-OBJECTIVE)
+fire_net13 <- fire_net13 %>%
+  left_join(., 
+            fire_net12%>%
+              dplyr::select(-fire_lastyear)%>%
+              mutate(fire=ifelse(fire==1,"Yes","No"))%>%
+              rename(fire_lastyear=fire)%>%
+              dplyr::select(fire_lastyear,uniqueID)%>%
+              st_drop_geometry(), 
+            by=c("uniqueID"))
+
+fire_net14 <- fire_perimeter14 %>% 
+  dplyr::select(OBJECTIVE) %>% 
+  mutate(fire = 0) %>% 
+  aggregate(., fishnet, sum) %>%
+  mutate(uniqueID = rownames(.),
+         fire = replace_na(fire, 0),
+         OBJECTIVE = replace_na(OBJECTIVE, 0)) %>%
+  mutate(fire = ifelse(OBJECTIVE == 0, 0, 1),
+         year = 2014) %>%
+  dplyr::select(-OBJECTIVE)
+fire_net14 <- fire_net14 %>%
+  left_join(., 
+            fire_net13%>%
+              dplyr::select(-fire_lastyear)%>%
+              mutate(fire=ifelse(fire==1,"Yes","No"))%>%
+              rename(fire_lastyear=fire)%>%
+              dplyr::select(fire_lastyear,uniqueID)%>%
+              st_drop_geometry(), 
+            by=c("uniqueID"))
+
+fire_net15 <- fire_perimeter15 %>% 
+  dplyr::select(OBJECTIVE) %>% 
+  mutate(fire = 0) %>% 
+  aggregate(., fishnet, sum) %>%
+  mutate(uniqueID = rownames(.),
+         fire = replace_na(fire, 0),
+         OBJECTIVE = replace_na(OBJECTIVE, 0)) %>%
+  mutate(fire = ifelse(OBJECTIVE == 0, 0, 1),
+         year = 2015) %>%
+  dplyr::select(-OBJECTIVE)
+fire_net15 <- fire_net15 %>%
+  left_join(., 
+            fire_net14%>%
+              dplyr::select(-fire_lastyear)%>%
+              mutate(fire=ifelse(fire==1,"Yes","No"))%>%
+              rename(fire_lastyear=fire)%>%
+              dplyr::select(fire_lastyear,uniqueID)%>%
+              st_drop_geometry(), 
+            by=c("uniqueID"))
+
+fire_net16 <- fire_perimeter16 %>% 
+  dplyr::select(OBJECTIVE) %>% 
+  mutate(fire = 0) %>% 
+  aggregate(., fishnet, sum) %>%
+  mutate(uniqueID = rownames(.),
+         fire = replace_na(fire, 0),
+         OBJECTIVE = replace_na(OBJECTIVE, 0)) %>%
+  mutate(fire = ifelse(OBJECTIVE == 0, 0, 1),
+         year = 2016) %>%
+  dplyr::select(-OBJECTIVE)
+fire_net16 <- fire_net16 %>%
+  left_join(., 
+            fire_net15%>%
+              dplyr::select(-fire_lastyear)%>%
+              mutate(fire=ifelse(fire==1,"Yes","No"))%>%
+              rename(fire_lastyear=fire)%>%
+              dplyr::select(fire_lastyear,uniqueID)%>%
+              st_drop_geometry(), 
+            by=c("uniqueID"))
+
+fire_net17 <- fire_perimeter17 %>% 
+  dplyr::select(OBJECTIVE) %>% 
+  mutate(fire = 0) %>% 
+  aggregate(., fishnet, sum) %>%
+  mutate(uniqueID = rownames(.),
+         fire = replace_na(fire, 0),
+         OBJECTIVE = replace_na(OBJECTIVE, 0)) %>%
+  mutate(fire = ifelse(OBJECTIVE == 0, 0, 1),
+         year = 2017) %>%
+  dplyr::select(-OBJECTIVE)
+fire_net17 <- fire_net17 %>%
+  left_join(., 
+            fire_net16%>%
+              dplyr::select(-fire_lastyear)%>%
+              mutate(fire=ifelse(fire==1,"Yes","No"))%>%
+              rename(fire_lastyear=fire)%>%
+              dplyr::select(fire_lastyear,uniqueID)%>%
+              st_drop_geometry(), 
+            by=c("uniqueID"))
+
+fire_net18 <- fire_perimeter18 %>% 
+  dplyr::select(OBJECTIVE) %>% 
+  mutate(fire = 0) %>% 
+  aggregate(., fishnet, sum) %>%
+  mutate(uniqueID = rownames(.),
+         fire = replace_na(fire, 0),
+         OBJECTIVE = replace_na(OBJECTIVE, 0)) %>%
+  mutate(fire = ifelse(OBJECTIVE == 0, 0, 1),
+         year = 2018) %>%
+  dplyr::select(-OBJECTIVE)
+fire_net18 <- fire_net18 %>%
+  left_join(., 
+            fire_net17%>%
+              dplyr::select(-fire_lastyear)%>%
+              mutate(fire=ifelse(fire==1,"Yes","No"))%>%
+              rename(fire_lastyear=fire)%>%
+              dplyr::select(fire_lastyear,uniqueID)%>%
+              st_drop_geometry(), 
+            by=c("uniqueID"))
+
+fire_net19 <- fire_perimeter19 %>% 
+  dplyr::select(OBJECTIVE) %>% 
+  mutate(fire = 0) %>% 
+  aggregate(., fishnet, sum) %>%
+  mutate(uniqueID = rownames(.),
+         fire = replace_na(fire, 0),
+         OBJECTIVE = replace_na(OBJECTIVE, 0)) %>%
+  mutate(fire = ifelse(OBJECTIVE == 0, 0, 1),
+         year = 2019) %>%
+  dplyr::select(-OBJECTIVE)
+fire_net19 <- fire_net19 %>%
+  left_join(., 
+            fire_net18%>%
+              dplyr::select(-fire_lastyear)%>%
+              mutate(fire=ifelse(fire==1,"Yes","No"))%>%
+              rename(fire_lastyear=fire)%>%
+              dplyr::select(fire_lastyear,uniqueID)%>%
+              st_drop_geometry(), 
+            by=c("uniqueID"))
+
+fire_net20 <- fire_perimeter20 %>% 
+  dplyr::select(OBJECTIVE) %>% 
+  mutate(fire = 0) %>% 
+  aggregate(., fishnet, sum) %>%
+  mutate(uniqueID = rownames(.),
+         fire = replace_na(fire, 0),
+         OBJECTIVE = replace_na(OBJECTIVE, 0)) %>%
+  mutate(fire = ifelse(OBJECTIVE == 0, 0, 1),
+         year = 2020) %>%
+  dplyr::select(-OBJECTIVE)
+fire_net20 <- fire_net20 %>%
+  left_join(., 
+            fire_net19%>%
+              dplyr::select(-fire_lastyear)%>%
+              mutate(fire=ifelse(fire==1,"Yes","No"))%>%
+              rename(fire_lastyear=fire)%>%
+              dplyr::select(fire_lastyear,uniqueID)%>%
+              st_drop_geometry(), 
+            by=c("uniqueID"))
+
+fire_net <- rbind(fire_net12, fire_net13, fire_net14, fire_net15,
+                  fire_net16, fire_net17, fire_net18, fire_net19,
+                  fire_net20)
+
+# Aggregate control burns
+control_burns12 <- control_burns %>% 
+  filter(YEAR_=="2012")
+
+control_burns13 <- control_burns %>% 
+  filter(YEAR_=="2013")
+
+control_burns14 <- control_burns %>% 
+  filter(YEAR_=="2014")
+
+control_burns15 <- control_burns %>% 
+  filter(YEAR_=="2015")
+
+control_burns16 <- control_burns %>% 
+  filter(YEAR_=="2016")
+
+control_burns17 <- control_burns %>% 
+  filter(YEAR_=="2017")
+
+control_burns18 <- control_burns %>% 
+  filter(YEAR_=="2018")
+
+control_burns19 <- control_burns %>% 
+  filter(YEAR_=="2019")
+
+control_burns20 <- control_burns %>% 
+  filter(YEAR_=="2020")
+
+control_net12 <- control_burns12 %>% 
+  dplyr::select(TREATMEN_1) %>% 
+  mutate(control_burn = 0) %>% 
+  aggregate(., fishnet, sum) %>%
+  mutate(uniqueID = rownames(.),
+         control_burn = replace_na(control_burn, 0),
+         TREATMEN_1 = replace_na(TREATMEN_1, 0)) %>%
+  mutate(control_burn = ifelse(TREATMEN_1 == 0, 0, 1),
+         year = 2012) %>%
+  dplyr::select(-TREATMEN_1)
+
+control_net13 <- control_burns13 %>% 
+  dplyr::select(TREATMEN_1) %>% 
+  mutate(control_burn = 0) %>% 
+  aggregate(., fishnet, sum) %>%
+  mutate(uniqueID = rownames(.),
+         control_burn = replace_na(control_burn, 0),
+         TREATMEN_1 = replace_na(TREATMEN_1, 0)) %>%
+  mutate(control_burn = ifelse(TREATMEN_1 == 0, 0, 1),
+         year = 2013) %>%
+  dplyr::select(-TREATMEN_1)
+
+control_net14 <- control_burns14 %>% 
+  dplyr::select(TREATMEN_1) %>% 
+  mutate(control_burn = 0) %>% 
+  aggregate(., fishnet, sum) %>%
+  mutate(uniqueID = rownames(.),
+         control_burn = replace_na(control_burn, 0),
+         TREATMEN_1 = replace_na(TREATMEN_1, 0)) %>%
+  mutate(control_burn = ifelse(TREATMEN_1 == 0, 0, 1),
+         year = 2014) %>%
+  dplyr::select(-TREATMEN_1)
+
+control_net15 <- control_burns15 %>% 
+  dplyr::select(TREATMEN_1) %>% 
+  mutate(control_burn = 0) %>% 
+  aggregate(., fishnet, sum) %>%
+  mutate(uniqueID = rownames(.),
+         control_burn = replace_na(control_burn, 0),
+         TREATMEN_1 = replace_na(TREATMEN_1, 0)) %>%
+  mutate(control_burn = ifelse(TREATMEN_1 == 0, 0, 1),
+         year = 2015) %>%
+  dplyr::select(-TREATMEN_1)
+
+control_net16 <- control_burns16 %>% 
+  dplyr::select(TREATMEN_1) %>% 
+  mutate(control_burn = 0) %>% 
+  aggregate(., fishnet, sum) %>%
+  mutate(uniqueID = rownames(.),
+         control_burn = replace_na(control_burn, 0),
+         TREATMEN_1 = replace_na(TREATMEN_1, 0)) %>%
+  mutate(control_burn = ifelse(TREATMEN_1 == 0, 0, 1),
+         year = 2016) %>%
+  dplyr::select(-TREATMEN_1)
+
+control_net17 <- control_burns17 %>% 
+  dplyr::select(TREATMEN_1) %>% 
+  mutate(control_burn = 0) %>% 
+  aggregate(., fishnet, sum) %>%
+  mutate(uniqueID = rownames(.),
+         control_burn = replace_na(control_burn, 0),
+         TREATMEN_1 = replace_na(TREATMEN_1, 0)) %>%
+  mutate(control_burn = ifelse(TREATMEN_1 == 0, 0, 1),
+         year = 2017) %>%
+  dplyr::select(-TREATMEN_1)
+
+control_net18 <- control_burns18 %>% 
+  dplyr::select(TREATMEN_1) %>% 
+  mutate(control_burn = 0) %>% 
+  aggregate(., fishnet, sum) %>%
+  mutate(uniqueID = rownames(.),
+         control_burn = replace_na(control_burn, 0),
+         TREATMEN_1 = replace_na(TREATMEN_1, 0)) %>%
+  mutate(control_burn = ifelse(TREATMEN_1 == 0, 0, 1),
+         year = 2018) %>%
+  dplyr::select(-TREATMEN_1)
+
+control_net19 <- control_burns19 %>% 
+  dplyr::select(TREATMEN_1) %>% 
+  mutate(control_burn = 0) %>% 
+  aggregate(., fishnet, sum) %>%
+  mutate(uniqueID = rownames(.),
+         control_burn = replace_na(control_burn, 0),
+         TREATMEN_1 = replace_na(TREATMEN_1, 0)) %>%
+  mutate(control_burn = ifelse(TREATMEN_1 == 0, 0, 1),
+         year = 2019) %>%
+  dplyr::select(-TREATMEN_1)
+
+control_net20 <- control_burns20 %>% 
+  dplyr::select(TREATMEN_1) %>% 
+  mutate(control_burn = 0) %>% 
+  aggregate(., fishnet, sum) %>%
+  mutate(uniqueID = rownames(.),
+         control_burn = replace_na(control_burn, 0),
+         TREATMEN_1 = replace_na(TREATMEN_1, 0)) %>%
+  mutate(control_burn = ifelse(TREATMEN_1 == 0, 0, 1),
+         year = 2020) %>%
+  dplyr::select(-TREATMEN_1)
+
+control_net <- rbind(control_net12, control_net13, control_net14, control_net15,
+                  control_net16, control_net17, control_net18, control_net19,
+                  control_net20)
+control_net$control_burn_chr <- ifelse(control_net$control_burn==1,"Yes","No")
+control_net <- control_net %>%
+  dplyr::select(-control_burn)
+
+# Aggregate fuel reduction
+fuel_reduction_net <- fuel_reduction %>% 
+  dplyr::select(TREATMEN_1) %>% 
+  mutate(fuel_reduction = 0) %>% 
+  aggregate(., fishnet, sum) %>%
+  mutate(uniqueID = rownames(.),
+         fuel_reduction = replace_na(fuel_reduction, 0),
+         TREATMEN_1 = replace_na(TREATMEN_1, 0)) %>%
+  mutate(fuel_reduction = ifelse(TREATMEN_1 == 0, 0, 1)) %>%
+  dplyr::select(-TREATMEN_1)
+
+fuel_reduction_net$fuel_reduction_chr <-
+  ifelse(fuel_reduction_net$fuel_reduction==1,"Yes","No")
+fuel_reduction_net <- fuel_reduction_net %>%
+  dplyr::select(-fuel_reduction)
+
+# Aggregate ecoregions
+ecoregions_net <-
+  st_centroid(fishnet) %>%
+    st_join(dplyr::select(ecoregions, ECOREGIO_1)) %>%
+      st_drop_geometry() %>%
+      left_join(dplyr::select(fishnet, geometry, uniqueID)) %>%
+      st_sf() 
+ecoregions_net$ECOREGIO_1 <- 
+  ifelse(is.na(ecoregions_net$ECOREGIO_1),"00", ecoregions_net$ECOREGIO_1)
+
+ecoregions_net$ECOREGIO_1 <- case_when(ecoregions_net$ECOREGIO_1=="261" ~ "Forest and Shrub",
+                                       ecoregions_net$ECOREGIO_1=="262" ~ "Dry Steppe",
+                                       ecoregions_net$ECOREGIO_1=="322" ~ "American Semi-Desert and Desert",
+                                       ecoregions_net$ECOREGIO_1=="341" ~ "Intermountain Semi-Desert and Desert",
+                                       ecoregions_net$ECOREGIO_1=="M261" ~ "Sierran Steppe - Mixed Forest - Coniferous Forest -Alpine Meadow",
+                                       ecoregions_net$ECOREGIO_1=="M262" ~ "Open Woodland - Shrub - Coniferous Forest - Meadow",
+                                       ecoregions_net$ECOREGIO_1=="00" ~ "Notype")
+
+# Aggregate seedzones
+seed_zones_net <-
+  st_centroid(fishnet) %>%
+    st_join(dplyr::select(seed_zones, REGION)) %>%
+      st_drop_geometry() %>%
+      left_join(dplyr::select(fishnet, geometry, uniqueID)) %>%
+      st_sf() 
+seed_zones_net$REGION <- 
+  ifelse(is.na(seed_zones_net$REGION),"00", seed_zones_net$REGION)
+
+seed_zones_net$REGION <- case_when(seed_zones_net$REGION=="0" ~ "North Coast Redwood",
+                                   seed_zones_net$REGION=="1" ~ "Central Coast",
+                                   seed_zones_net$REGION=="3" ~ "North Coast Interior",
+                                   seed_zones_net$REGION=="5" ~ "West Slope Cascades-Sierra",
+                                   seed_zones_net$REGION=="7" ~ "East Slope Cascades-Sierra",
+                                   seed_zones_net$REGION=="9" ~ "Four Areas",
+                                   seed_zones_net$REGION=="00" ~ "Notype")
+
+# Aggregate WUI
+WUI_net <- 
+  st_centroid(fishnet) %>%
+    st_join(dplyr::select(WUI, WUICLASS10)) %>%
+      st_drop_geometry() %>%
+      left_join(dplyr::select(fishnet, geometry, uniqueID)) %>%
+      st_sf() 
+WUI_net$WUICLASS10 <- 
+  ifelse(is.na(WUI_net$WUICLASS10),"Notype", WUI_net$WUICLASS10)
+
+# Aggregate facilities
+facilities_net <- fishnet %>%
+  mutate(
+    facilities.nn=nn_function(st_coordinates(st_centroid(fishnet)),
+                              st_coordinates(facilities),1))
+
+# Aggregate Veg
+Veg_net <- 
+  st_centroid(fishnet) %>%
+    st_join(dplyr::select(Veg, land_cover)) %>%
+      st_drop_geometry() %>%
+      left_join(dplyr::select(fishnet, geometry, uniqueID)) %>%
+      st_sf() 
+Veg_net$land_cover <- 
+  ifelse(is.na(Veg_net$land_cover),"Notype", Veg_net$land_cover)
+
+# Aggregate elevation
+elevation_net <- 
+  st_centroid(fishnet) %>%
+    st_join(dplyr::select(elevation, gridcode)) %>%
+      st_drop_geometry() %>%
+      left_join(dplyr::select(fishnet, geometry, uniqueID)) %>%
+      st_sf()
+
+# Aggregate county
+county_net <- 
+  st_centroid(fishnet) %>%
+    st_join(dplyr::select(county, strCounty_1)) %>%
+      st_drop_geometry() %>%
+      left_join(dplyr::select(fishnet, geometry, uniqueID)) %>%
+      st_sf()
+
+# Aggregate slope
+slope_net <- 
+  st_centroid(fishnet) %>%
+    st_join(dplyr::select(slope, gridcode)) %>%
+      st_drop_geometry() %>%
+      left_join(dplyr::select(fishnet, geometry, uniqueID)) %>%
+      st_sf() %>%
+  rename(slope=gridcode)
+```
+
+## Weather data
+
+Weather data, taken mainly at airports throughout the region, included the following measures for entire each year studied, 2012-2020.
+
++ Maximum Temperature
+
++ Mean Temperature 
+
++ Minimum Humidity
+
++ Mean Humidity
+
++ Maximum Humidity
+
++ Mean Precipitation
+
++ Mean Wind Speed
+
++ Maximum Wind Speed
+
+
+```{r weather_data, message=FALSE, warning=FALSE, cache=TRUE, results=FALSE}
+stations <- c("FAT", "BFL", "MHV", "TSP", "HJO", "AVX", "BUR", "EMT", "HHR", 
+              "POC", "WJF", "LGB", "WHP", "LAX", "PMD", "SDB", "SMO", "VNY", 
+              "MAE", "MRY", "SNS", "CVH", "PRB", "SBP", "LPC", "SBA", "SMX", 
+              "IZA", "PTV", "VIS", "CMA", "OXR")
+
+station_coords <- riem_stations("CA_ASOS") %>%
+  filter(id %in% stations) %>%
+  st_as_sf(coords = c("lon","lat"), crs = 4326, agr = "constant") %>%
+  st_transform('EPSG:3310') %>%
+  select(id, geometry) 
+
+fire_net_coords <- fire_net12 %>%
+  dplyr::select(geometry, uniqueID) %>%
+  st_centroid() 
+
+closest_weather_station_to_fishnet <- nn2(st_coordinates(station_coords), 
+                                          st_coordinates(fire_net_coords), k = 1)$nn.idx
+
+closest_weather_station_to_fishnet1220 <- rbind(closest_weather_station_to_fishnet,
+                                           closest_weather_station_to_fishnet,
+                                           closest_weather_station_to_fishnet,
+                                           closest_weather_station_to_fishnet,
+                                           closest_weather_station_to_fishnet,
+                                           closest_weather_station_to_fishnet,
+                                           closest_weather_station_to_fishnet,
+                                           closest_weather_station_to_fishnet,
+                                           closest_weather_station_to_fishnet)
+
+fire_net$station_id <- closest_weather_station_to_fishnet1220
+
+fire_net <- fire_net %>%
+  mutate(id=case_when(station_id == 1 ~ station_coords$id[1],
+                      station_id == 2 ~ station_coords$id[2],
+                      station_id == 3 ~ station_coords$id[3],
+                      station_id == 4 ~ station_coords$id[4],
+                      station_id == 5 ~ station_coords$id[5],
+                      station_id == 6 ~ station_coords$id[6],
+                      station_id == 7 ~ station_coords$id[7],
+                      station_id == 8 ~ station_coords$id[8],
+                      station_id == 9 ~ station_coords$id[9],
+                      station_id == 10 ~ station_coords$id[10],
+                      station_id == 11 ~ station_coords$id[11],
+                      station_id == 12 ~ station_coords$id[12],
+                      station_id == 13 ~ station_coords$id[13],
+                      station_id == 14 ~ station_coords$id[14],
+                      station_id == 15 ~ station_coords$id[15],
+                      station_id == 16 ~ station_coords$id[16],
+                      station_id == 17 ~ station_coords$id[17],
+                      station_id == 18 ~ station_coords$id[18],
+                      station_id == 19 ~ station_coords$id[19],
+                      station_id == 20 ~ station_coords$id[20],
+                      station_id == 21 ~ station_coords$id[21],
+                      station_id == 22 ~ station_coords$id[22],
+                      station_id == 23 ~ station_coords$id[23],
+                      station_id == 24 ~ station_coords$id[24],
+                      station_id == 25 ~ station_coords$id[25],
+                      station_id == 26 ~ station_coords$id[26],
+                      station_id == 27 ~ station_coords$id[27],
+                      station_id == 28 ~ station_coords$id[28],
+                      station_id == 29 ~ station_coords$id[29],
+                      station_id == 30 ~ station_coords$id[30],
+                      station_id == 31 ~ station_coords$id[31],
+                      station_id == 32 ~ station_coords$id[32]))
+
+weather12 <- get_weather(stations, 2012)
+weather13 <- get_weather(stations, 2013)
+weather14 <- get_weather(stations, 2014)
+weather15 <- get_weather(stations, 2015)
+weather16 <- get_weather(stations, 2016)
+weather17 <- get_weather(stations, 2017)
+weather18 <- get_weather(stations, 2018)
+weather19 <- get_weather(stations, 2019)
+weather20 <- get_weather(stations, 2020)
+
+weather <- 
+  rbind(weather12, weather13, weather14, weather15, weather16, 
+        weather17, weather18, weather19, weather20)
+  
+fire_weather <- left_join(fire_net%>%st_drop_geometry(), weather, by = c("id", "year"))
+
+# Combine weather data with other features
+fire_reg <- fire_weather %>%
+  left_join(., control_net%>%st_drop_geometry(), by=c("uniqueID","year")) %>%
+  left_join(., fuel_reduction_net%>%st_drop_geometry(), by=c("uniqueID")) %>%
+  left_join(., facilities_net%>%st_drop_geometry(), by=c("uniqueID")) %>%
+  left_join(., Veg_net%>%st_drop_geometry(), by=c("uniqueID")) %>%
+  left_join(., ecoregions_net%>%st_drop_geometry(), by=c("uniqueID")) %>%
+  left_join(., seed_zones_net%>%st_drop_geometry(), by=c("uniqueID")) %>%
+  left_join(., WUI_net%>%st_drop_geometry(), by=c("uniqueID")) %>%
+  left_join(., elevation_net%>%st_drop_geometry(), by=c("uniqueID")) %>%
+  left_join(., county_net%>%st_drop_geometry(), by=c("uniqueID")) %>%
+  left_join(., slope_net%>%st_drop_geometry(), by=c("uniqueID")) %>%
+  na.omit()
+
+# Create a binary feature with elevation
+fire_reg <- fire_reg %>%
+  mutate(elevation_chr=ifelse(gridcode>=3000,"3000orhigher","lower3000"))
+```
+
+## Data Exploration
+
+Figure 7 displays the fire history within each cell for the selected counties.  This reveals clear clustering of fire locations, with nearly every cell on the Southern most Coast highlighted.
+
+```{r map_dv, message=FALSE, warning=FALSE}
+# Plot dependent variable in fishnet
+fire_net1220 <- fire_perimeter1220 %>% 
+  dplyr::select(OBJECTIVE) %>% 
+  mutate(fire = 0) %>% 
+  aggregate(., fishnet, sum) %>%
+  mutate(uniqueID = rownames(.),
+         fire = replace_na(fire, 0),
+         OBJECTIVE = replace_na(OBJECTIVE, 0)) %>%
+  mutate(fire = ifelse(OBJECTIVE == 0, 0, 1)) %>%
+  dplyr::select(-OBJECTIVE)
+
+ggplot() +
+  geom_sf(data = fire_net1220, aes(fill = fire))+
+  scale_fill_viridis() +
+  labs(title="Figure 7 - Dependent Variable")+
+  mapTheme()
+```
+
+Figure 8 displays the mean values for cells without fire compared with the cells with fire for several predictors.
+
+```{r numeric_feature_distribution, message=FALSE, warning=FALSE}
+fire_reg$fire_chr <- ifelse(fire_reg$fire==1,"Fire","No_Fire")
+
+fire_reg %>% 
+  dplyr::select(fire_chr, Max_Temp, Mean_Temp, Min_Humidity,Mean_Humidity,Max_Humidity,
+                Mean_Precipitation,Mean_Wind_Speed, Max_Wind_Speed, facilities.nn,
+                gridcode, slope) %>%
+  gather(Variable, value, -fire_chr) %>%
+  ggplot(aes(fire_chr, value, fill=fire_chr)) + 
+  geom_bar(position = "dodge", stat = "summary", fun = "mean") + 
+  facet_wrap(~Variable, scales = "free") +
+  scale_fill_manual(values = palette2) +
+  labs(x="Fire", y="Mean", 
+       title = "Figure 8 - Feature with Wildfire",
+       subtitle = "(continous outcomes)") +
+  theme(legend.position = "none")
+```
+
+Unsurprisingly, fire facilities are strategically placed near the locations of most fires.  Fire cells have higher elevation (denoted by gridcode in Figure 8) steeper slopes (measured in degrees x 1,000) and higher wind speeds.  Aside from those variables, the means of cells with and without fires are not noticeably different.
+
+Additionally, Figure 9 displays the correlation matrix of several predictors.
+
+```{r correlation_matrix, message=FALSE, warning=FALSE}
+numericVars <- select_if(fire_reg, is.numeric) %>%
+  dplyr::select(Max_Temp, Mean_Temp, Min_Humidity,Mean_Humidity,Max_Humidity,
+                Mean_Precipitation,Mean_Wind_Speed, Max_Wind_Speed, facilities.nn,
+                gridcode, slope)
+
+ggcorrplot(
+  round(cor(numericVars), 1), 
+  p.mat = cor_pmat(numericVars),
+  colors = c("#25CB10", "white", "#FA7800"),
+  type="lower",
+  insig = "blank") +  
+  labs(title = "Figure 9 - Correlation Matrix") 
+```
+
+Interestingly, the elevation and distance to facilities are positively correlated.
+
+# Model
+
+As we said in our introduction, the occurrence of wildfires mostly depends on human activities, so in the absence of data describing human activities in detail, wildfire predictions are actually very random. We first perform logistic regression on wildfire data from 2012 to 2019 years, and then apply the model to the 2020 data for validation testing.
+
+## Logistic Regression
+
+Initially, our model only included weather data, which wasn't terribly accurate. With the addition of various continuous variables and categorical variables, the fitting of the model is getting better and better. Although, from the output, there are many variables that are not significant, these are almost all contained in the categorical variables with extremely high correlation. Our model also takes the repetitiveness of time into consideration. When counting fire and weather data, we added a filter for the year.
+
+Our model includes the following features:
+
++ fire_lastyear (whether there is a fire in the grid cell last year)
+
++ Max_Temp (max temperature during the fire season)
+
++ Mean_Temp (mean temperature during the fire season)
+
++ Min_Humidity (min humidity during the fire season)
+
++ Mean_Humidity (mean humidity during the fire season)
+
++ Max_Humidity (max humidity during the fire season)
+
++ Mean_Precipitation (max precipitation during the fire season)
+
++ Mean_Wind_Speed (mean wind speed during the fire season)
+
++ Max_Wind_Speed (max wind speed during the fire season)
+
++ control_burn_chr (whether there is a control burn in the grid cell in each year or not)
+
++ fuel_reduction_chr (whether there is a fuel reduction in the grid cell or not)
+
++ ECOREGIO_1 (ecoregion of the grid cell)
+
++ REGION (seed zone of the grid cell)
+
++ WUICLASS10 (wildland urban interface type of the grid cell)
+
++ Facilities.nn (distance to the nearest fire suppression facilities)
+
++ land_cover (land cover of the grid cell)
+
++ gridcode (average elevation in the grid cell)
+
++ slope (average slope in the grid cell)
+
++ strCounty_1 (county of the grid cell)
+
++ elevation_chr (whether the elevation in the grid cell is over 3000 feet or not)
+
+```{r glm_regression, message=FALSE, warning=FALSE}
+# select year from 2012-2019
+fire_reg1219 <- fire_reg %>%
+  filter(year==2012|year==2013|year==2014|year==2015|
+         year==2016|year==2017|year==2018|year==2019)
+
+# set training and testing set
+set.seed(3456)
+trainIndex <- createDataPartition(fire_reg1219$fire, p = .65,
+                                  list = FALSE,
+                                  times = 1)
+fireTrain <- fire_reg[ trainIndex,]
+fireTest  <- fire_reg[-trainIndex,]
+
+# run the regression
+fireModel <- glm(fire ~ .,
+                  data=fireTrain %>% 
+                    dplyr::select(-uniqueID, -year, -station_id, -id, -fire_chr),
+                  family="binomial" (link="logit"))
+
+summary(fireModel)
+```
+
+## ROC Curve
+
+The ROC curve, gives us another visual “goodness of fit” metric. The “AUC” output is the area under the ROC curve, which gives a better understanding of the curve. The closer the AUC is to 1, the better our model is. The smoothness and upward protrusion of the curve is also a good performance of our model. To be honest, the value of “AUC” is in a very embarrassing range. We can't say that the model is excellent, nor can we say that the model is awful. But considering the difficulty of wildfire prediction, we think this result is quite good, especially for the central California which contains relatively more human activities near Los Angeles.
+
+```{r ROC_area, message=FALSE, warning=FALSE}
+# predict test set
+testProbs <- data.frame(Outcome = as.factor(fireTest$fire),
+                        Probs = predict(fireModel, fireTest, type= "response"))
+
+# area under ROC Curve
+auc(testProbs$Outcome, testProbs$Probs)
+```
+
+```{r ROC_curve, message=FALSE, warning=FALSE}
+# ROC curve
+ggplot(testProbs, aes(d = as.numeric(testProbs$Outcome), m = Probs)) +
+  geom_roc(n.cuts = 50, labels = FALSE, colour = "#FE9900") +
+  style_roc(theme = theme_grey) +
+  geom_abline(slope = 1, intercept = 0, size = 1.5, color = 'grey') +
+  labs(title = "Figure 10 - ROC Curve")
+```
+
+## Distribution of Predicted Probabilities
+
+The plots below show the distribution of predicted probabilities for fire and no fire. The predicted probabilities for no fire and for fire is pretty close.
+
+```{r predicted_probabilities_distribution, message=FALSE, warning=FALSE}
+# Distribution of predicted probabilities by observed outcome
+ggplot(testProbs, aes(x = Probs, fill = as.factor(Outcome))) + 
+  geom_density() +
+  facet_grid(Outcome ~ .) +
+  scale_fill_manual(values = palette2) +
+  labs(x = "Fire", y = "Density of probabilities",
+       title = "Figure 11 - Distribution of predicted probabilities by observed outcome") +
+  theme(strip.text.x = element_text(size = 18),
+        legend.position = "none")
+```
+
+```{r predicted_fire_hist, message=FALSE, warning=FALSE}
+# filter fire and no fire
+testProbsFire <- testProbs %>% filter (Outcome=="1")
+testProbsNoFire <- testProbs %>% filter (Outcome=="0")
+
+# histogram of fire
+hist(testProbsFire$Probs, 
+     col="#F96167",
+       main="Figure 12 - Predicted Probabilities for Grid Cells with Fire",
+     xlab="Probability")
+```
+
+```{r predicted_nofire_hist, message=FALSE, warning=FALSE}
+# histogram of nofire
+hist(testProbsNoFire$Probs, 
+     col="#FCE77D",
+       main="Figure 13 - Predicted Probabilities for Grid Cells with No Fire",
+     xlab="Probability")
+```
+
+The mean predicted probability for cells with no fire and the mean predicted probability for cells with fire help us choose the threshold we need.
+
+```{r mean_predicted_probability_nofire, message=FALSE, warning=FALSE}
+mean(testProbsNoFire$Probs)
+```
+
+```{r mean_predicted_probability_fire, message=FALSE, warning=FALSE}
+mean(testProbsFire$Probs)
+```
+
+## Confusion Matrix
+
+A “confusion matrix” shows us the rate at which we got True Positives (aka Sensitivity), False Positives, True Negatives (aka Specificity) and False Negatives. Specifically, True Positives means the proportion of actual positives (fire) that were predicted to be positive, False Positives means the proportion of actual positives (no fire) that were predicted to be positive, True Negatives means proportion of actual negatives (no fire) that were predicted to be negatives and False Negatives means proportion of actual negatives (fire) that were predicted to be negatives.
+
+```{r confusion matrix, message=FALSE, warning=FALSE}
+# set 0.07 as cut-off value
+testProbs <- 
+  testProbs %>%
+  mutate(predOutcome  = as.factor(ifelse(testProbs$Probs > 0.07 , 1, 0)))
+
+# confusion matrix
+caret::confusionMatrix(testProbs$predOutcome, testProbs$Outcome, 
+                       positive = "1")
+```
+
+# Validation
+
+## Time Validation
+We reproduced the regression part of above on the 2020 data.
+
+```{r 2020model, message=FALSE, warning=FALSE}
+# filter year 2020
+fire_reg2020 <- fire_reg %>%
+  filter(year==2020)
+
+# 2020 model
+fireModel2020 <- glm(fire ~ .,
+                  data=fire_reg2020 %>% 
+                    dplyr::select(-uniqueID, -year, -station_id, -id, -fire_chr),
+                  family="binomial" (link="logit"))
+
+summary(fireModel2020)
+```
+
+```{r 2020hist_fire, message=FALSE, warning=FALSE}
+# predict 2020
+testProbs2020 <- data.frame(Outcome = as.factor(fire_reg2020$fire),
+                        Probs = predict(fireModel2020, fire_reg2020, type= "response"))
+
+# filter fire and no fire
+testProbs2020nofire <- testProbs2020 %>% filter(Outcome==0)
+testProbs2020fire <- testProbs2020 %>% filter (Outcome==1)
+
+# histogram of fire
+hist(testProbs2020fire$Probs, 
+     col="#F96167",
+       main="Figure 14 - Predicted Probabilities for Grid Cells with Fire in 2020",
+     xlab="Probability")
+```
+
+```{r 2020hist_nofire, message=FALSE, warning=FALSE}
+# histogram of nofire
+hist(testProbs2020nofire$Probs, 
+     col="#FCE77D",
+       main="Figure 15 - Predicted Probabilities for Grid Cells with No Fire in 2020",
+     xlab="Probability")
+```
+
+Still, we need the mean predicted probability for cells with no fire and the mean predicted probability for cells with fire help us find the threshold.
+
+```{r 2020mean_predicted_probability_nofire, message=FALSE, warning=FALSE}
+mean(testProbs2020nofire$Probs)
+```
+
+```{r 2020mean_predicted_probability_fire, message=FALSE, warning=FALSE}
+mean(testProbs2020fire$Probs)
+```
+
+The sensitivity and specificity in the confusion matrix are better than those of the regression model from 12 to 19 years, showing the strong time generalizability of our model, and also showing that our model can predict wildfires in the future stably.
+
+```{r confusion matrix b, message=FALSE, warning=FALSE}
+# set 0.19 as cut-off value
+testProbs2020 <- 
+  testProbs2020 %>%
+  mutate(predOutcome  = as.factor(ifelse(testProbs2020$Probs > 0.19 , 1, 0)))
+
+# confusion matrix
+caret::confusionMatrix(testProbs2020$predOutcome, testProbs2020$Outcome, 
+                       positive = "1")
+```
+
+## Cross Validation
+Cross validation is another great method to test generalizability. The graphs below visualize the area under the ROC curve, sensitivity, and specificity of the final model across folds. The cluster pattern of three variables indicates the undoubtable generalizability of our model.
+
+```{r cross_validation, message=FALSE, warning=FALSE}
+ctrl <- trainControl(method = "cv", number = 100, classProbs=TRUE, 
+                     summaryFunction=twoClassSummary)
+
+cvFit <- train(fire ~ ., data = fire_weather %>%
+                 dplyr::select(-uniqueID, -year, -station_id, -id)%>%
+                 dplyr::mutate(fire=ifelse(fire==1,"Fire","No_Fire")),
+               method="glm", family="binomial",
+               metric="ROC", trControl = ctrl)
+
+cvFit
+```
+
+```{r goodness_of_fit, message=FALSE, warning=FALSE}
+dplyr::select(cvFit$resample, -Resample) %>%
+  gather(metric, value) %>%
+  left_join(gather(cvFit$results[2:4], metric, mean)) %>%
+  ggplot(aes(value)) + 
+  geom_histogram(bins=35, fill = "#FF006A") +
+  facet_wrap(~metric) +
+  geom_vline(aes(xintercept = mean), colour = "#981FAC", linetype = 3, size = 1.5) +
+  scale_x_continuous(limits = c(0, 1)) +
+  labs(x="Goodness of Fit", y="Count", title="Figure 16 - CV Goodness of Fit Metrics",
+       subtitle = "Across-fold mean represented as dotted lines") +
+  plotTheme()
+```
+
+# Discussion
+
+Considering the difficulty of wildfire prediction, we think our model works well. From the results of the validation, the generalizability of our model is very good, which is very hard to achieve for the area we are studying, because frequent human activities would bring uncertainty to the regression model. 
+
+During the forecasting process, we found that the numeric variable of elevation performed very poorly in our model, which is anti-common-sense actually, because we know that, in general, the lower the place, the greater the probability of wildfire. But when we use binary variables, elevation information becomes important for the model. Therefore, we believe that the data processing method has a great influence on the model. For other insignificant variables, we may need to further transform them to make our model better, which will also be our future direction of improvement.
+
+# Conclusion
+
+Fire Finders is proud of a model that shows strong accuracy, sensitivity, and specificity.  While this tool is far from perfect and has room for improvement, it is useful to concerned Californians.  Figure 17 displays the model's predicted risk scores from 2012-2019 and Figure 18 displays this just for 2020.
+
+```{r risk2012-2019, message=FALSE, warning=FALSE}
+testProbs_all <- data.frame(Outcome = as.factor(fire_reg1219$fire),
+                        Probs = predict(fireModel, fire_reg1219, type= "response"),
+                        uniqueID= fire_reg1219$uniqueID,
+                        year= fire_reg1219$year)
+
+testProbs_all <- testProbs_all %>% mutate(Risk_Cat=
+                                            case_when(Probs <=.03 ~ "Low",
+                                                   Probs > 0.03 & Probs < .1 ~ "Medium",
+                                                   Probs >=.1 ~ "High" ))
+
+
+
+fire_reg_probs <- right_join(fire_net, testProbs_all, by = c("uniqueID","year"))
+
+palette3 <- c("#B81D13","#008450","#EFB700")
+
+ggplot() +
+  geom_sf(data=fire_reg_probs, aes(fill=Risk_Cat), color="transparent")+
+  scale_fill_manual(values=palette3, name="Risk Score") +
+  labs(title="Figure 17 - Predicted Risk Scores Across 11 California Counties 2012-2019")+
+  mapTheme()
+```
+
+```{r risk2020, message=FALSE, warning=FALSE}
+testProbs_2020 <- data.frame(Outcome = as.factor(fire_reg2020$fire),
+                        Probs = predict(fireModel, fire_reg2020, type= "response"),
+                        uniqueID= fire_reg2020$uniqueID,
+                        year= fire_reg2020$year)
+
+testProbs_2020 <- testProbs_all %>% mutate(Risk_Cat=
+                                            case_when(Probs <=.03 ~ "Low",
+                                                   Probs > 0.03 & Probs < .2 ~ "Medium",
+                                                   Probs >=.2 ~ "High" ))
+
+
+
+fire_reg_probs2020 <- right_join(fire_net, testProbs_all, by = c("uniqueID","year"))
+
+palette3 <- c("#B81D13","#008450","#EFB700")
+
+ggplot() +
+  geom_sf(data=fire_reg_probs2020, aes(fill=Risk_Cat), color="transparent")+
+  scale_fill_manual(values=palette3, name="Risk Score") +
+  labs(title="Figure 18 - Predicted Risk Scores Across 11 California Counties 2020")+
+  mapTheme()
+```
+
+These visuals tell a clear story and, as a prospective homeowner, the information could be highly influential in buying property.  At the very least, for existing homeowners in high risk regions this information could increase awareness of their risk, possibly encouraging those residents to take fire dangers seriously and limit negligent activities that frequently start these destructive wildfires.  This awareness, coupled with the best practices outlined on the Resource Component in Figure 4, could help save lives and protect property.
+
+As the climate continues to change and wildfires become more frequent, every action that spreads awareness and potentially reduces fire risks can make a difference and Fire Finders hopes to contribute to the solution.
+
+**Reference**
+$^{1}$https://www.mercurynews.com/2021/08/14/where-else-will-i-go-californias-climate-migrants-search-for-home-a-year-after-santa-cruz-mountains-lightning-fires#:~:text=Growing%20breed%20of%20Californians&text=Just%20last%20year%2C%20more%20than,sign%20of%20things%20to%20come.
+$^{2}$://calmatters.org/environment/2021/07/california-fires-2020/
+$^{3}$https://komonews.com/news/wildfire/what-are-the-perfect-conditions-for-wildfires
+$^{4}$https://ballotpedia.org/Federal_land_policy_in_California
+$^{5}$https://www.rff.org/news/press-releases/wildfires-change-american-west-social-inequity-persists-public-response/
+$^{6}$https://sgp.fas.org/crs/misc/IF10244.pdf
